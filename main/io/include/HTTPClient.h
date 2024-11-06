@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <stddef.h>     // for size_t
@@ -17,6 +16,7 @@
 #include "picohttpparser.h"  // for phr_header
 
 namespace bell {
+
 class HTTPClient {
  public:
   // most basic header type, represents by a key-val
@@ -46,18 +46,20 @@ class HTTPClient {
 
   class Response {
    public:
-    Response(){};
+    Response(size_t numHeaders = 32) 
+      : phResponseHeaders(new phr_header[numHeaders]), maxHeaders(numHeaders) {}
     ~Response();
 
     /**
     * Initializes a connection with a given url.
     */
-    void connect(const std::string& url);
+    int connect(const std::string& url, size_t numHeaders = 32);
+    int reconnect();
 
-    void rawRequest(const std::string& method, const std::string& url,
+    bool rawRequest(const std::string& method, const std::string& url,
                     const std::vector<uint8_t>& content, Headers& headers);
-    void get(const std::string& url, Headers headers = {});
-    void post(const std::string& url, Headers headers = {},
+    bool get(const std::string& url, Headers headers = {});
+    bool post(const std::string& url, Headers headers = {},
               const std::vector<uint8_t>& body = {});
 
     std::string_view body();
@@ -73,7 +75,8 @@ class HTTPClient {
     bell::URLParser urlParser;
     bell::SocketStream socketStream;
 
-    struct phr_header phResponseHeaders[32];
+    phr_header* phResponseHeaders;
+    size_t maxHeaders;  // Store max headers to handle numHeaders limit
     const size_t HTTP_BUF_SIZE = 1024;
 
     std::vector<uint8_t> httpBuffer = std::vector<uint8_t>(HTTP_BUF_SIZE);
@@ -85,7 +88,7 @@ class HTTPClient {
 
     Headers responseHeaders;
 
-    void readResponseHeaders();
+    bool readResponseHeaders();
     void readRawBody();
   };
 
@@ -98,20 +101,22 @@ class HTTPClient {
   };
 
   static std::unique_ptr<Response> get(const std::string& url,
-                                       Headers headers = {}) {
-    auto response = std::make_unique<Response>();
-    response->connect(url);
-    response->get(url, headers);
+                                       Headers headers = {}, size_t numHeaders = 32) {
+    auto response = std::make_unique<Response>(numHeaders);
+    if(response->connect(url, numHeaders) == 0)
+      response->get(url, headers);
     return response;
   }
 
   static std::unique_ptr<Response> post(const std::string& url,
                                         Headers headers = {},
-                                        const std::vector<uint8_t>& body = {}) {
-    auto response = std::make_unique<Response>();
-    response->connect(url);
-    response->post(url, headers, body);
+                                        const std::vector<uint8_t>& body = {}, 
+                                        size_t numHeaders = 32) {
+    auto response = std::make_unique<Response>(numHeaders);
+    if(response->connect(url, numHeaders) == 0)
+      response->post(url, headers, body);
     return response;
   }
 };
+
 }  // namespace bell

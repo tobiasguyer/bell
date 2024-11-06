@@ -8,13 +8,13 @@
 #include <stdexcept>              // for runtime_error
 
 #include "BellLogger.h"  // for AbstractLogger, BELL_LOG
+#include "BellUtils.h"  // for BELL_SLEEP_MS
 #include "X509Bundle.h"  // for shouldVerify, attach
 
 /**
  * Platform TLSSocket implementation for the mbedtls
  */
-bell::TLSSocket::TLSSocket() {
-  this->isClosed = false;
+bell::TLSSocket::TLSSocket() : isClosed(false) {
   mbedtls_net_init(&server_fd);
   mbedtls_ssl_init(&ssl);
   mbedtls_ssl_config_init(&conf);
@@ -27,33 +27,32 @@ bell::TLSSocket::TLSSocket() {
   mbedtls_entropy_init(&entropy);
 
   const char* pers = "euphonium";
-  int ret;
-  if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
-                                   (const unsigned char*)pers, strlen(pers))) !=
-      0) {
-    BELL_LOG(error, "http_tls",
-             "failed\n  ! mbedtls_ctr_drbg_seed returned %d\n", ret);
-    throw std::runtime_error("mbedtls_ctr_drbg_seed failed");
+  int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                                  reinterpret_cast<const unsigned char*>(pers),
+                                  strlen(pers));
+  if (ret != 0) {
+    BELL_LOG(error, "http_tls", "Failed to seed DRBG: %d\n", ret);
+    throw std::runtime_error("Failed to seed DRBG");
   }
 }
 
 void bell::TLSSocket::open(const std::string& hostUrl, uint16_t port) {
-  int ret;
-  if ((ret = mbedtls_net_connect(&server_fd, hostUrl.c_str(),
-                                 std::to_string(port).c_str(),
-                                 MBEDTLS_NET_PROTO_TCP)) != 0) {
-    BELL_LOG(error, "http_tls", "failed! connect returned %d\n", ret);
+  int ret = mbedtls_net_connect(&server_fd, hostUrl.c_str(),
+                                std::to_string(port).c_str(), MBEDTLS_NET_PROTO_TCP);
+  if (ret != 0) {
+    BELL_LOG(error, "http_tls", "Connection failed for %s:%d with error %d\n",
+             hostUrl.c_str(), port, ret);
+//    throw std::runtime_error("Connection failed");
   }
 
-  if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
-                                         MBEDTLS_SSL_TRANSPORT_STREAM,
-                                         MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-
-    BELL_LOG(error, "http_tls", "failed! config returned %d\n", ret);
-    throw std::runtime_error("mbedtls_ssl_config_defaults failed");
+  ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT);
+  if (ret != 0) {
+    BELL_LOG(error, "http_tls", "SSL config setup failed: %d\n", ret);
+    throw std::runtime_error("SSL configuration failed");
   }
 
-  // Only verify if the X509 bundle is present
   if (bell::X509Bundle::shouldVerify()) {
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
   } else {
@@ -61,33 +60,69 @@ void bell::TLSSocket::open(const std::string& hostUrl, uint16_t port) {
   }
 
   mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+//  mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
   mbedtls_ssl_setup(&ssl, &conf);
 
   if ((ret = mbedtls_ssl_set_hostname(&ssl, hostUrl.c_str())) != 0) {
-    throw std::runtime_error("mbedtls_ssl_set_hostname failed");
+    throw std::runtime_error("Failed to set SSL hostname");
   }
-  mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv,
-                      NULL);
 
+  mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+  // Retry the handshake a limited number of times
+  int retries = 5;
   while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
     if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-      BELL_LOG(error, "http_tls", "failed! config returned %d\n", ret);
-      throw std::runtime_error("mbedtls_ssl_handshake error");
+      BELL_LOG(error, "http_tls", "SSL handshake failed with error %d\n", ret);
+      throw std::runtime_error("SSL handshake failed");
+    }
+    if (--retries <= 0) {
+      BELL_LOG(error, "http_tls", "SSL handshake retry limit reached");
+      throw std::runtime_error("SSL handshake retries exhausted");
     }
   }
+  isClosed = false;
 }
 
-size_t bell::TLSSocket::read(uint8_t* buf, size_t len) {
-  return mbedtls_ssl_read(&ssl, buf, len);
+ssize_t bell::TLSSocket::read(uint8_t* buf, size_t len) {
+  int ret;
+  const int maxRetries = 10;
+  for (int i = 0; i < maxRetries; ++i){
+  do {
+    ret = mbedtls_ssl_read(&ssl, buf, len);
+  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == -34) {
+            // Network temporarily unavailable, retry after delay
+            BELL_LOG(error, "http_tls", "TLS read error (-34), retrying... Attempt %d", i + 1);
+            BELL_SLEEP_MS(10);
+        }else if (ret < 0) {
+    close();//isClosed = true;
+    BELL_LOG(error, "http_tls", "Read error with code %d\n", ret);
+    throw std::runtime_error("Error in recv");
+  } else return static_cast<ssize_t>(ret);
+  }
+  return -1;
 }
 
-size_t bell::TLSSocket::write(uint8_t* buf, size_t len) {
-  return mbedtls_ssl_write(&ssl, buf, len);
+ssize_t bell::TLSSocket::write(const uint8_t* buf, size_t len) {
+  int ret;
+  do {
+    ret = mbedtls_ssl_write(&ssl, buf, len);
+  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+
+  if (ret < 0) {
+    close();//isClosed = true;
+    BELL_LOG(error, "http_tls", "Write error with code %d\n", ret);
+    throw std::runtime_error("Error in write");
+  }
+  return static_cast<ssize_t>(ret);
 }
 
 size_t bell::TLSSocket::poll() {
   return mbedtls_ssl_get_bytes_avail(&ssl);
 }
+
 bool bell::TLSSocket::isOpen() {
   return !isClosed;
 }
@@ -99,6 +134,6 @@ void bell::TLSSocket::close() {
     mbedtls_ssl_config_free(&conf);
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
-    this->isClosed = true;
+    isClosed = true;
   }
 }

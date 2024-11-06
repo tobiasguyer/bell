@@ -85,11 +85,11 @@ class TCPSocket : public bell::Socket {
     isClosed = false;
   }
 
-  size_t read(uint8_t* buf, size_t len) {
+  ssize_t read(uint8_t* buf, size_t len) {
     return recv(sockFd, (char*)buf, len, 0);
   }
 
-  size_t write(uint8_t* buf, size_t len) {
+  ssize_t write(const uint8_t* buf, size_t len) {
     return send(sockFd, (char*)buf, len, 0);
   }
 

@@ -6,26 +6,64 @@
 #include <cctype>     // for tolower
 #include <ostream>    // for operator<<, basic_ostream
 #include <stdexcept>  // for runtime_error
+#include <algorithm>
 
 #include "BellSocket.h"  // for bell
+#include "BellUtils.h"   // for BELL_SLEEP_MS
+#include "BellLogger.h"  // for AbstractLogger, BELL_LOG
 
 using namespace bell;
 
-void HTTPClient::Response::connect(const std::string& url) {
-  urlParser = bell::URLParser::parse(url);
+int HTTPClient::Response::connect(const std::string& url, size_t numHeaders) {
+  try {
+    urlParser = bell::URLParser::parse(url);
+    maxHeaders = numHeaders;
+    delete[] phResponseHeaders;  // Ensure no memory leaks if reallocating
+    phResponseHeaders = new phr_header[maxHeaders];
 
-  // Open socket of type
-  this->socketStream.open(urlParser.host, urlParser.port,
-                          urlParser.schema == "https");
+    // Open socket of type
+    return this->socketStream.open(urlParser.host, urlParser.port,
+                                   urlParser.schema == "https");
+  } catch (const std::invalid_argument& e) {
+    BELL_LOG(error, "httpClient", "Error while parsing URL: %s", e.what());
+    return 1;
+  } catch (const std::runtime_error& e) {
+    BELL_LOG(error, "httpClient", "Stream operation failed while connecting: %s", e.what());
+    return 1;
+  } catch (const std::exception& e) {
+    BELL_LOG(error, "httpClient", "Unexpected exception: %s", e.what());
+    return 2;
+  }
+}
+
+int HTTPClient::Response::reconnect() {
+  try {
+    // Ensure the stream is properly closed before attempting to reconnect
+    if (this->socketStream.isOpen()) {
+      BELL_LOG(debug, "httpClient", "Socket is open. Closing...");
+      this->socketStream.flush();
+      this->socketStream.close();
+    }
+    BELL_SLEEP_MS(10);
+    return this->socketStream.open(urlParser.host, urlParser.port,
+                                   urlParser.schema == "https");
+  } catch (const std::runtime_error& e) {
+    BELL_LOG(error, "httpClient", "Stream operation failed while reconnecting: %s", e.what());
+    return 1;
+  } catch (const std::exception& e) {
+    BELL_LOG(error, "httpClient", "Unexpected exception: %s", e.what());
+    return 2;
+  }
 }
 
 HTTPClient::Response::~Response() {
+  delete[] phResponseHeaders;  // Free the dynamically allocated header array
   if (this->socketStream.isOpen()) {
     this->socketStream.close();
   }
 }
 
-void HTTPClient::Response::rawRequest(const std::string& url,
+bool HTTPClient::Response::rawRequest(const std::string& url,
                                       const std::string& method,
                                       const std::vector<uint8_t>& content,
                                       Headers& headers) {
@@ -34,100 +72,162 @@ void HTTPClient::Response::rawRequest(const std::string& url,
   // Prepare a request
   const char* reqEnd = "\r\n";
 
-  socketStream << method << " " << urlParser.path << " HTTP/1.1" << reqEnd;
-  socketStream << "Host: " << urlParser.host << ":" << urlParser.port << reqEnd;
-  socketStream << "Connection: keep-alive" << reqEnd;
-  socketStream << "Accept: */*" << reqEnd;
+  try {
+    socketStream << method << " " << urlParser.path << " HTTP/1.1" << reqEnd;
+    socketStream << "Host: " << urlParser.host << ":" << urlParser.port << reqEnd;
+    socketStream << "Connection: keep-alive" << reqEnd;
+    socketStream << "Accept: */*" << reqEnd;
 
-  // Write content
-  if (content.size() > 0) {
-    socketStream << "Content-Length: " << content.size() << reqEnd;
+    // Write content
+    if (!content.empty()) {
+      socketStream << "Content-Length: " << content.size() << reqEnd;
+    }
+
+    // Write headers
+    for (auto& header : headers) {
+      socketStream << header.first << ": " << header.second << reqEnd;
+    }
+
+    socketStream << reqEnd;
+
+    // Write request body if it exists
+    if (!content.empty()) {
+      socketStream.write(reinterpret_cast<const char*>(content.data()), content.size());
+    }
+
+    socketStream.flush();
+  } catch (const std::ios_base::failure& e) {
+    BELL_LOG(error, "httpClient", "Stream operation failed while sending request: %s", e.what());
+    if (reconnect() != 0) {
+      return false;  // If reconnection fails, return failure
+    }
+    return rawRequest(url, method, content, headers);  // Retry the request
   }
-
-  // Write headers
-  for (auto& header : headers) {
-    socketStream << header.first << ": " << header.second << reqEnd;
-  }
-
-  socketStream << reqEnd;
-
-  // Write request body
-  if (content.size() > 0) {
-    socketStream.write((const char*)content.data(), content.size());
-  }
-
-  socketStream.flush();
 
   // Parse response
-  readResponseHeaders();
+  try {
+    return readResponseHeaders();
+  } catch (const std::underflow_error& e) {
+    BELL_LOG(error, "httpClient", "Underflow error during response reading: %s", e.what());
+    this->socketStream.flush();
+    this->socketStream.close();
+    return false;
+  } catch (const std::runtime_error& e) {
+    BELL_LOG(error, "httpClient", "Runtime error while receiving packet: %s", e.what());
+    if (reconnect() != 0) {
+      return false;
+    }
+    return rawRequest(url, method, content, headers);
+  } catch (const std::exception& e) {
+    BELL_LOG(error, "Unexpected exception: %s", e.what());
+    return false;
+  }
 }
 
-void HTTPClient::Response::readResponseHeaders() {
-  char *method, *path;
+bool HTTPClient::Response::readResponseHeaders() {
   const char* msgPointer;
-
   size_t msgLen;
-  int pret, minorVersion, status;
-
-  size_t prevbuflen = 0, numHeaders;
+  int pret;
+  int minorVersion;
+  int status;
+  size_t prevbuflen = 0;
+  size_t numHeaders = maxHeaders;
   this->httpBufferAvailable = 0;
+  size_t retries = 0;
+  bool foundHttpHeader = false;
 
-  while (1) {
+  while (true) {
     socketStream.getline((char*)httpBuffer.data() + httpBufferAvailable,
                          httpBuffer.size() - httpBufferAvailable);
+  
+    auto bytesRead = socketStream.gcount();
 
-    prevbuflen = httpBufferAvailable;
-    httpBufferAvailable += socketStream.gcount();
+    if (bytesRead > 0) {
+      prevbuflen = httpBufferAvailable;
+      httpBufferAvailable += bytesRead;
+      
+      if (!foundHttpHeader) {
+        const char* httpStart = strstr((const char*)httpBuffer.data(), "HTTP/");
+        if (httpStart) {
+          size_t offset = httpStart - (const char*)httpBuffer.data();
+          memmove(httpBuffer.data(), httpStart, httpBufferAvailable - offset);
+          httpBufferAvailable -= offset;
+          foundHttpHeader = true;
+        } else {
+          throw std::runtime_error("Cannot parse HTTP response");
+        }
+      }
 
-    // Restore delimiters
-    memcpy(httpBuffer.data() + httpBufferAvailable - 2, "\r\n", 2);
+      if (httpBufferAvailable >= 2) {
+        memcpy(httpBuffer.data() + httpBufferAvailable - 2, "\r\n", 2);
+      } else {
+        std::string rawResponse((char*)httpBuffer.data(), httpBufferAvailable);
+        BELL_LOG(debug, "httpClient", "Raw HTTP response so far:\n%s", rawResponse.c_str());
+        throw std::out_of_range("Insufficient space to restore CRLF");
+      }
 
-    // Parse the request
-    numHeaders = sizeof(phResponseHeaders) / sizeof(phResponseHeaders[0]);
+      numHeaders = maxHeaders;
+      pret = phr_parse_response((const char*)httpBuffer.data(), httpBufferAvailable,
+                                &minorVersion, &status, &msgPointer, &msgLen,
+                                phResponseHeaders, &numHeaders, prevbuflen);
 
-    pret =
-        phr_parse_response((const char*)httpBuffer.data(), httpBufferAvailable,
-                           &minorVersion, &status, &msgPointer, &msgLen,
-                           phResponseHeaders, &numHeaders, prevbuflen);
+      if (pret > 0) {
+        break;
+      } else if (pret == -1) {
+        std::string rawResponse((char*)httpBuffer.data(), httpBufferAvailable);
+        BELL_LOG(debug, "httpClient", "Raw HTTP response so far:\n%s", rawResponse.c_str());
+        throw std::runtime_error("Cannot parse HTTP response");
+      }
 
-    if (pret > 0) {
-      break; /* successfully parsed the request */
-    } else if (pret == -1)
-      throw std::runtime_error("Cannot parse http response");
+      assert(pret == -2);
+    }
 
-    /* request is incomplete, continue the loop */
-    assert(pret == -2);
-    if (httpBufferAvailable == httpBuffer.size())
+    if (httpBufferAvailable == 0) {
+      if (socketStream.eof()) {
+        throw std::underflow_error("Buffer not available and EOF reached");
+      } else if(retries < 10 && socketStream.isOpen()) {
+        BELL_LOG(debug, "httpClient", "Buffer not available. Waiting for more data...");
+        BELL_SLEEP_MS(10);
+        retries++;
+      } else {
+        throw std::underflow_error("Buffer not available and yield failed");
+      }
+    }
+
+    if (httpBufferAvailable >= httpBuffer.size()) {
+      std::string rawResponse((char*)httpBuffer.data(), httpBufferAvailable);
+      BELL_LOG(debug, "httpClient", "Raw HTTP response so far:\n%s", rawResponse.c_str());
       throw std::runtime_error("Response too large");
+    }
   }
 
-  this->responseHeaders = {};
+  if (numHeaders > maxHeaders) {
+    throw std::runtime_error("Too many headers");
+  }
 
-  // Headers have benen read
-  for (int headerIndex = 0; headerIndex < numHeaders; headerIndex++) {
-    this->responseHeaders.push_back(
-        ValueHeader{std::string(phResponseHeaders[headerIndex].name,
-                                phResponseHeaders[headerIndex].name_len),
-                    std::string(phResponseHeaders[headerIndex].value,
-                                phResponseHeaders[headerIndex].value_len)});
+  this->responseHeaders.clear();
+  for (size_t i = 0; i < numHeaders; ++i) {
+    this->responseHeaders.emplace_back(
+        std::string(phResponseHeaders[i].name, phResponseHeaders[i].name_len),
+        std::string(phResponseHeaders[i].value, phResponseHeaders[i].value_len));
   }
 
   std::string contentLengthValue = std::string(header("content-length"));
-  if (contentLengthValue.size() > 0) {
+  if (!contentLengthValue.empty()) {
     this->hasContentSize = true;
     this->contentSize = std::stoi(contentLengthValue);
   }
+
+  return true;
 }
 
-void HTTPClient::Response::get(const std::string& url, Headers headers) {
-  std::string method = "GET";
-  return this->rawRequest(url, method, {}, headers);
+bool HTTPClient::Response::get(const std::string& url, Headers headers) {
+  return this->rawRequest(url, "GET", {}, headers);
 }
 
-void HTTPClient::Response::post(const std::string& url, Headers headers,
+bool HTTPClient::Response::post(const std::string& url, Headers headers,
                                 const std::vector<uint8_t>& body) {
-  std::string method = "POST";
-  return this->rawRequest(url, method, body, headers);
+  return this->rawRequest(url, "POST", body, headers);
 }
 
 size_t HTTPClient::Response::contentLength() {
