@@ -13,7 +13,9 @@
 #include <string>  // for string
 
 #ifdef ESP_PLATFORM
+#include "freertos/FreeRTOS.h"
 #include "esp_system.h"
+#include "freertos/task.h"
 #endif
 
 namespace bell {
