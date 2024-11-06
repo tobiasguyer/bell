@@ -59,7 +59,7 @@ class BellLogger : public bell::AbstractLogger {
     logMutex.wait();  // Ensure exclusive access for logging
     
     printTimestamp(); // Print timestamp if enabled
-    printf(color);    // Set the desired color for this log level
+    printf("%s",color);    // Set the desired color for this log level
     
     printf("%s ", level);  // Print log level (e.g., "D ", "E ", "I ")
     if (enableSubmodule) {
