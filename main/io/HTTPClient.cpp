@@ -38,10 +38,12 @@ int HTTPClient::Response::connect(const std::string& url, size_t numHeaders) {
 }
 
 int HTTPClient::Response::reconnect() {
+  if (retries__ == 0)
+    return 3;
+  retries__--;
   try {
     // Ensure the stream is properly closed before attempting to reconnect
     if (this->socketStream.isOpen()) {
-      BELL_LOG(debug, "httpClient", "Socket is open. Closing...");
       this->socketStream.flush();
       this->socketStream.close();
     }
@@ -156,12 +158,28 @@ bool HTTPClient::Response::readResponseHeaders() {
       if (!foundHttpHeader) {
         const char* httpStart = strstr((const char*)httpBuffer.data(), "HTTP/");
         if (httpStart) {
-          size_t offset = httpStart - (const char*)httpBuffer.data();
-          memmove(httpBuffer.data(), httpStart, httpBufferAvailable - offset);
-          httpBufferAvailable -= offset;
-          foundHttpHeader = true;
+          if ((httpStart >= (const char*)httpBuffer.data()) &&
+              (httpStart <
+               (const char*)httpBuffer.data() + httpBufferAvailable)) {
+            size_t offset = httpStart - (const char*)httpBuffer.data();
+            if (offset > httpBufferAvailable) {
+              BELL_LOG(debug, "httpClient",
+                       "Invalid offset detected: offset=%zu, "
+                       "httpBufferAvailable=%zu",
+                       offset, httpBufferAvailable);
+              throw std::runtime_error("Invalid offset for memmove");
+            }
+            memmove(httpBuffer.data(), httpStart, httpBufferAvailable - offset);
+            httpBufferAvailable -= offset;
+            foundHttpHeader = true;
+          } else {
+            BELL_LOG(debug, "httpClient",
+                     "Invalid offset for memmove: httpBufferAvailable=%zu",
+                     httpBufferAvailable);
+            throw std::runtime_error("Invalid offset for memmove");
+          }
         } else {
-          throw std::runtime_error("Cannot parse HTTP response");
+          throw std::runtime_error("HTTP header not found");
         }
       }
 
@@ -169,8 +187,6 @@ bool HTTPClient::Response::readResponseHeaders() {
         memcpy(httpBuffer.data() + httpBufferAvailable - 2, "\r\n", 2);
       } else {
         std::string rawResponse((char*)httpBuffer.data(), httpBufferAvailable);
-        BELL_LOG(debug, "httpClient", "Raw HTTP response so far:\n%s",
-                 rawResponse.c_str());
         throw std::out_of_range("Insufficient space to restore CRLF");
       }
 
@@ -183,9 +199,6 @@ bool HTTPClient::Response::readResponseHeaders() {
       if (pret > 0) {
         break;
       } else if (pret == -1) {
-        std::string rawResponse((char*)httpBuffer.data(), httpBufferAvailable);
-        BELL_LOG(debug, "httpClient", "Raw HTTP response so far:\n%s",
-                 rawResponse.c_str());
         throw std::runtime_error("Cannot parse HTTP response");
       }
 
@@ -216,8 +229,7 @@ bool HTTPClient::Response::readResponseHeaders() {
   if (numHeaders > maxHeaders) {
     throw std::runtime_error("Too many headers");
   }
-
-  this->responseHeaders.clear();
+  this->responseHeaders = {};
   auto bufferStart = (const char*)httpBuffer.data();
   for (size_t i = 0; i < numHeaders; ++i) {
     // Check if name is out of bounds
@@ -240,10 +252,10 @@ bool HTTPClient::Response::readResponseHeaders() {
                     phResponseHeaders[i].value_len));
   }
 
-  std::string contentLengthValue = std::string(header("content-length"));
-  if (!contentLengthValue.empty()) {
+  std::string_view contentLengthView = header("content-length");
+  if (!contentLengthView.empty()) {
     this->hasContentSize = true;
-    this->contentSize = std::stoi(contentLengthValue);
+    this->contentSize = std::stoi(std::string(contentLengthView));
   }
 
   return true;
@@ -264,11 +276,14 @@ size_t HTTPClient::Response::contentLength() {
 
 std::string_view HTTPClient::Response::header(const std::string& headerName) {
   for (auto& header : this->responseHeaders) {
+    assert(!header.first.empty() && "Header key shouldn't be empty");
+    assert(!header.second.empty() && "Header value shouldn't be empty");
     std::string headerValue = header.first;
     std::transform(headerValue.begin(), headerValue.end(), headerValue.begin(),
                    [](unsigned char c) { return std::tolower(c); });
     if (headerName == headerValue) {
-      return header.second;
+      const auto& value = header.second;
+      return std::string_view(value);
     }
   }
 

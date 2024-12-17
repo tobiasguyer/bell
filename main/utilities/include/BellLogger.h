@@ -18,9 +18,9 @@ class AbstractLogger {
   bool enableTimestamp = false;
   bool shortTime = false;
 
-  virtual void debug(const std::string filename, int line, std::string submodule,
-                     const char* format, ...) = 0;
-  virtual void error(std::string filename, int line, std::string submodule, 
+  virtual void debug(const std::string filename, int line,
+                     std::string submodule, const char* format, ...) = 0;
+  virtual void error(std::string filename, int line, std::string submodule,
                      const char* format, ...) = 0;
   virtual void info(std::string filename, int line, std::string submodule,
                     const char* format, ...) = 0;
@@ -34,46 +34,53 @@ class BellLogger : public bell::AbstractLogger {
     // Initialize the mutex on logger creation
   }
 
-  void debug(std::string filename, int line, std::string submodule, const char* format, ...) override {
+  void debug(std::string filename, int line, std::string submodule,
+             const char* format, ...) override {
     va_list args;
     va_start(args, format);
     logMessage("D", filename, line, submodule, colorRed, format, args);
     va_end(args);
   }
 
-  void error(std::string filename, int line, std::string submodule, const char* format, ...) override {
+  void error(std::string filename, int line, std::string submodule,
+             const char* format, ...) override {
     va_list args;
     va_start(args, format);
     logMessage("E", filename, line, submodule, colorRed, format, args);
     va_end(args);
   }
 
-  void info(std::string filename, int line, std::string submodule, const char* format, ...) override {
+  void info(std::string filename, int line, std::string submodule,
+            const char* format, ...) override {
     va_list args;
     va_start(args, format);
     logMessage("I", filename, line, submodule, colorBlue, format, args);
     va_end(args);
   }
+
  private:
-  void logMessage(const char* level, const std::string& filename, int line, const std::string& submodule, const char* color, const char* format, va_list args) {
-    logMutex.wait();  // Ensure exclusive access for logging
-    
-    printTimestamp(); // Print timestamp if enabled
-    printf("%s",color);    // Set the desired color for this log level
-    
+  void logMessage(const char* level, const std::string& filename, int line,
+                  const std::string& submodule, const char* color,
+                  const char* format, va_list args) {
+    logMutex.twait(200);  // Ensure exclusive access for logging
+
+    printTimestamp();     // Print timestamp if enabled
+    printf("%s", color);  // Set the desired color for this log level
+
     printf("%s ", level);  // Print log level (e.g., "D ", "E ", "I ")
     if (enableSubmodule) {
-        printf("[%s] ", submodule.c_str());  // Print submodule if enabled
+      printf("[%s] ", submodule.c_str());  // Print submodule if enabled
     }
-    printFilename(filename); // Print filename and line number
+    printFilename(filename);  // Print filename and line number
     printf(":%d: ", line);
 
-    vprintf(format, args);  // Print the actual log message with format arguments
+    vprintf(format,
+            args);  // Print the actual log message with format arguments
 
     printf("\n");
     printf(colorReset);  // Reset color for future logs
 
-    logMutex.give();  // Release exclusive access    
+    logMutex.give();  // Release exclusive access
   }
 
   void printTimestamp() {

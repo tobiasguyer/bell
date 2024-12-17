@@ -46,8 +46,9 @@ class HTTPClient {
 
   class Response {
    public:
-    Response(size_t numHeaders = 32) 
-      : phResponseHeaders(new phr_header[numHeaders]), maxHeaders(numHeaders) {}
+    Response(size_t numHeaders = 32)
+        : phResponseHeaders(new phr_header[numHeaders]),
+          maxHeaders(numHeaders) {}
     ~Response();
 
     /**
@@ -84,6 +85,7 @@ class HTTPClient {
     size_t httpBufferAvailable;
 
     size_t contentSize = 0;
+    uint8_t retries__ = 5;
     bool hasContentSize = false;
 
     Headers responseHeaders;
@@ -101,19 +103,20 @@ class HTTPClient {
   };
 
   static std::unique_ptr<Response> get(const std::string& url,
-                                       Headers headers = {}, size_t numHeaders = 32) {
+                                       Headers headers = {},
+                                       size_t numHeaders = 32) {
     auto response = std::make_unique<Response>(numHeaders);
-    if(response->connect(url, numHeaders) == 0)
+    if (response->connect(url, numHeaders) == 0)
       response->get(url, headers);
     return response;
   }
 
   static std::unique_ptr<Response> post(const std::string& url,
                                         Headers headers = {},
-                                        const std::vector<uint8_t>& body = {}, 
+                                        const std::vector<uint8_t>& body = {},
                                         size_t numHeaders = 32) {
     auto response = std::make_unique<Response>(numHeaders);
-    if(response->connect(url, numHeaders) == 0)
+    if (response->connect(url, numHeaders) == 0)
       response->post(url, headers, body);
     return response;
   }

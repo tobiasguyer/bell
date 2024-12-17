@@ -65,7 +65,20 @@ class TCPSocket : public bell::Socket {
     }
 
     sockFd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-
+#if defined(ESP_PLATFORM)
+    // hasn't been tested yet, but could potentially resolve the memory leak on espidf v5
+    // https://esp32.com/viewtopic.php?t=31858
+    struct linger linger_opt = {
+        .l_onoff = 1,  // Enable linger: Must be 1 for l_linger time to be used.
+        .l_linger = 0,
+    };
+    if (setsockopt(sockFd, SOL_SOCKET, SO_LINGER, &linger_opt,
+                   sizeof(linger_opt)) != 0) {
+      close();
+      BELL_LOG(error, "http", "Could not connect to %s. Error %d", host.c_str(),
+               errno);
+      throw std::runtime_error("Resolve failed");
+    }
     err = connect(sockFd, addr->ai_addr, addr->ai_addrlen);
     if (err < 0) {
       close();
@@ -73,6 +86,7 @@ class TCPSocket : public bell::Socket {
                errno);
       throw std::runtime_error("Resolve failed");
     }
+#endif
 
     int flag = 1;
     setsockopt(sockFd,       /* socket affected */
